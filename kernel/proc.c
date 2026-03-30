@@ -54,6 +54,16 @@ proc_init(void)
     //           vm_page_alloc
     //           vm_page_insert
     // YOUR CODE HERE
+    struct proc *p;
+    for (p = proc; p < &proc[NPROC]; p++) {
+        void *pa = vm_page_alloc();
+        if (pa == 0) panic("proc_init: out of memory");
+        uint64 va = KSTACK((int)(p - proc));
+        vm_page_insert(kernel_pagetable, va, (uint64)pa, PTE_R | PTE_W);
+        //                               ^^ va first, pa second
+        p->kstack = va;
+    }
+    
 }
 
 
@@ -63,7 +73,7 @@ struct proc*
 proc_load_user_init(void)
 {
     void *bin = &_binary_user_init_start;
-    struct proc *p = 0x00;
+    struct proc *p = proc_alloc();
 
     // Allocate a new process. If there is no process avaialble, panic.
     // Use proc_load_elf to load up the elf string. 
@@ -71,6 +81,9 @@ proc_load_user_init(void)
     // for you. The bin pointer points to the embedded BLOB which
     // contains the program image for init.
     // YOUR CODE HERE
+
+    if (p == 0) panic("proc_load_user_init: no free procs");
+    if (proc_load_elf(p, bin) < 0) panic("proc_load_user_init: elf load failed");
 
     return p;
 }
@@ -102,6 +115,27 @@ proc_alloc(void)
     //          memset
     //          proc_pagetable
     // YOUR CODE HERE
+
+    struct proc *p;
+    for (p = proc; p < &proc[NPROC]; p++) {
+        if (p->state == UNUSED) {
+            p->pid = nextpid++;
+
+            if ((p->trapframe = vm_page_alloc()) == 0) return 0;
+            memset(p->trapframe, 0, PGSIZE);
+
+            if ((p->pagetable = proc_pagetable(p)) == 0) {
+                proc_free(p);
+                return 0;
+            }
+
+            memset(&p->context, 0, sizeof(p->context));
+            p->context.ra = (uint64)usertrapret;
+            p->context.sp = p->kstack + PGSIZE;
+
+            return p;
+        }
+    }
     return 0;
 }
 
@@ -118,6 +152,16 @@ proc_free(struct proc *p)
     //         vm_page_free
     //         proc_free_pagetable
     // YOUR CODE HERE
+
+    if (p->trapframe) vm_page_free(p->trapframe);
+    p->trapframe = 0;
+
+    if (p->pagetable) proc_free_pagetable(p->pagetable, p->sz);
+    p->pagetable = 0;
+
+    p->sz    = 0;
+    p->pid   = 0;
+    p->state = UNUSED;
 }
 
 
@@ -132,7 +176,6 @@ proc_load_elf(struct proc *p, void *bin)
     struct proghdr ph;
     int i, off;
     uint64 sz=0, sp=0;
-    pagetable_t pagetable=0;
 
     // get the elf header from bin
     elf = *(struct elfhdr*) bin;
@@ -170,8 +213,38 @@ proc_load_elf(struct proc *p, void *bin)
     //       exec works in xv6. Happy reading!
     // YOUR CODE HERE
 
+
+    for(i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
+        ph = *(struct proghdr*)(bin + off);
+        if(ph.type != ELF_PROG_LOAD) continue;
+        if(ph.memsz < ph.filesz)           goto bad;
+        if(ph.vaddr + ph.memsz < ph.vaddr) goto bad;
+        if(ph.vaddr % PGSIZE != 0)         goto bad;
+        if(ph.vaddr < sz)                  goto bad;
+
+        sz = proc_resize(p->pagetable, sz, ph.vaddr + ph.memsz);
+        if(sz == 0) goto bad;
+
+        if(proc_loadseg(p->pagetable, ph.vaddr, bin, ph.off, ph.filesz) < 0)
+            goto bad;
+    }
+
+    sz = PGROUNDUP(sz);
+    sz = proc_resize(p->pagetable, sz, sz + 2 * PGSIZE);
+    if(sz == 0) goto bad;
+    proc_guard(p->pagetable, sz - 2 * PGSIZE);
+    sp = sz;
+
+    // No old pagetable to destroy — proc_alloc's table IS our table
+    p->sz            = sz;
+    p->trapframe->epc = elf.entry;
+    p->trapframe->sp  = sp;
+    p->state         = RUNNABLE;
+    return 0;
+
 bad:
-    // YOUR CODE HERE
+    // Shrink back any pages we allocated during this failed load
+    proc_resize(p->pagetable, sz, 0);
     return -1;
 }
 
@@ -188,7 +261,21 @@ uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     // xv6 equivalent. What did I change? 
     //
     // YOUR CODE HERE
-    return 0;
+
+    if (newsz < oldsz)
+        return proc_shrink(pagetable, oldsz, newsz);
+
+    uint64 a = PGROUNDUP(oldsz);
+    for (; a < newsz; a += PGSIZE) {
+        void *pa = vm_page_alloc();
+        if (pa == 0) return 0;  // out of memory
+        if (vm_page_insert(pagetable, a, (uint64)pa,
+                           PTE_W | PTE_X | PTE_R | PTE_U) < 0) {
+            vm_page_free(pa);
+            return 0;
+        }
+    }
+    return newsz;
 }
 
 
@@ -209,7 +296,30 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   // You should also make sure to handle errors as was done in the xv6
   // table.
   // YOUR CODE HERE
-  return -1;
+
+  uint64 i;
+    for (i = 0; i < sz; i += PGSIZE) {
+        uint64 pa = vm_lookup(old, i);
+        if (pa == 0) goto err;
+
+        void *mem = vm_page_alloc();
+        if (mem == 0) goto err;
+
+        memmove(mem, (void*)pa, PGSIZE);
+
+        pte_t *pte = walk_pgtable(old, i, 0);
+        uint64 flags = PTE_FLAGS(*pte);
+
+        if (vm_page_insert(new, i, (uint64)mem, flags)) {
+            vm_page_free(mem);
+            goto err;
+        }
+    }
+    return 0;
+
+err:
+    proc_shrink(new, sz, 0);
+    return -1;
 }
 
 
@@ -235,7 +345,20 @@ proc_pagetable(struct proc *p)
     //    vm_page_free
     //    vm_page_remove
     // YOUR CODE HERE
-    return 0;
+
+    pagetable_t pagetable = vm_create_pagetable();
+    if(pagetable == 0) return 0;
+    if(vm_page_insert(pagetable, TRAMPOLINE, (uint64)trampoline, PTE_R | PTE_X)){
+      vm_page_free((void*)pagetable);
+      return 0;
+    }
+
+    if(vm_page_insert(pagetable, TRAPFRAME,  (uint64)(p->trapframe), PTE_R | PTE_W)){
+      vm_page_remove(pagetable, TRAMPOLINE, 1, 0);
+      vm_page_free((void*)pagetable);
+      return 0;
+    }
+    return pagetable;
 }
 
 
@@ -251,6 +374,10 @@ proc_free_pagetable(pagetable_t pagetable, uint64 sz)
     // 3.) Free the user page table.
     // Functions Used: vm_page_remove, proc_freewalk
     // YOUR CODE HERE
+    vm_page_remove(pagetable, TRAMPOLINE, 1, 0);
+    vm_page_remove(pagetable, TRAPFRAME,  1, 0);
+    proc_shrink(pagetable, sz, 0);
+    proc_freewalk(pagetable); 
 }
 
 
@@ -314,8 +441,15 @@ proc_loadseg(pagetable_t pagetable, uint64 va, void *bin, uint offset, uint sz)
   // As an added hint, I have included my variable declarations 
   // above.
   // YOUR CODE HERE
+  for (i = 0; i < sz; i += PGSIZE) {
+      pa = vm_lookup(pagetable, va + i); // get physical addr for this va
+        if (pa == 0) return -1;
+
+        n = (sz - i < PGSIZE) ? sz - i : PGSIZE; // bytes remaining vs full page
+        memmove((void*)pa, bin + offset + i, n);
+    }
   
-  return -1;
+  return 0;
 }
 
 

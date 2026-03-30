@@ -13,7 +13,8 @@ OBJS = \
   $K/swtch.o \
   $K/plic.o\
   $K/tests.o\
-  $K/main.o
+  $K/main.o\
+  $K/scheduler.o
 
 BINFILES=$U/bin-init.o
 
